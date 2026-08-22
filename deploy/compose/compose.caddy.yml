@@ -19,6 +19,7 @@ services:
     restart: unless-stopped
     networks:
       - buzz-net
+      - twenty-net
 
 volumes:
   buzz-caddy-data:
@@ -27,3 +28,7 @@ volumes:
   buzz-caddy-config:
     labels:
       com.buzz.volume: caddy-config
+
+networks:
+  twenty-net:
+    external: true
