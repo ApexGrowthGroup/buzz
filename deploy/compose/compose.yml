@@ -18,6 +18,12 @@ services:
       BUZZ_S3_SECRET_KEY: ${BUZZ_S3_SECRET_KEY:?set BUZZ_S3_SECRET_KEY}
       BUZZ_S3_BUCKET: ${BUZZ_S3_BUCKET:-buzz-media}
       BUZZ_GIT_REPO_PATH: /data/git
+      # Media-Uploads: Upstream-Defaults sind 2 pro Pubkey / 8 global. Zwei parallele
+      # Bild-Anhaenge im Client reissen das Pro-Pubkey-Limit, der dritte bekommt 429
+      # ("relay rate-limited: quota exceeded"). Pro-Pubkey wird auf den globalen Wert
+      # gedeckelt, deshalb muss der global mitwachsen.
+      BUZZ_MEDIA_MAX_CONCURRENT_UPLOADS_PER_PUBKEY: ${BUZZ_MEDIA_MAX_CONCURRENT_UPLOADS_PER_PUBKEY:-6}
+      BUZZ_MEDIA_MAX_CONCURRENT_UPLOADS: ${BUZZ_MEDIA_MAX_CONCURRENT_UPLOADS:-24}
       BUZZ_AUTO_MIGRATE: ${BUZZ_AUTO_MIGRATE:-false}
       BUZZ_GIT_CONFORMANCE_PROBE: ${BUZZ_GIT_CONFORMANCE_PROBE:-true}
     ports:
