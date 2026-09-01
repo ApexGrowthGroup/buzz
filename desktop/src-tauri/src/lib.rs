@@ -2,6 +2,7 @@
 mod app_menu;
 mod app_state;
 mod archive;
+mod build_identity;
 mod builderlab;
 mod channel_head_cache;
 mod commands;
@@ -41,6 +42,7 @@ mod relay_admission;
 mod reset;
 mod secret_store;
 mod shutdown;
+mod team_catalog;
 mod templates;
 mod terminal_runtime;
 #[cfg_attr(not(test), allow(dead_code))]
@@ -95,11 +97,7 @@ use tauri_plugin_window_state::StateFlags;
 use tray_menu::show_main_window;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // mesh-llm's async chains (model download, node start/join) overflow
-    // tokio's default 2 MiB worker stacks — a stack-guard SIGABRT, not a
-    // panic. Upstream mesh-llm and mesh-console both run on 8 MiB worker
-    // stacks for this reason; give Tauri's command runtime the same headroom
-    // before anything else touches tauri::async_runtime.
+    // mesh-llm async chains overflow tokio's default 2 MiB stacks; run on 8 MiB like upstream.
     #[cfg(feature = "mesh-llm")]
     match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -130,7 +128,7 @@ pub fn run() {
             }
             // Forward any deep link URLs from the duplicate launch.
             for arg in &argv {
-                if arg.starts_with("buzz://") {
+                if crate::build_identity::is_deep_link_for_build(arg) {
                     handle_deep_link_url(app, arg);
                 }
             }
@@ -400,7 +398,10 @@ pub fn run() {
             // the now-inert ~/.sprout; the frontend dedupes the toast.
             // Suppressed when a reset completed this boot: the nest was wiped and
             // a fresh ~/.sprout-less state is exactly what we want.
-            if !reset_outcome.completed && migration::migrate_legacy_nest() {
+            if !crate::build_identity::is_demo_build()
+                && !reset_outcome.completed
+                && migration::migrate_legacy_nest()
+            {
                 let _ = app_handle.emit("legacy-nest-migrated", ());
             }
 
@@ -724,6 +725,7 @@ pub fn run() {
             discover_backend_providers,
             probe_backend_provider,
             persona_catalog::fetch_persona_catalog,
+            team_catalog::fetch_team_catalog,
             unread_catch_up::unread_catch_up,
             observed_unread::observed_unread_open_scope,
             observed_unread::observed_unread_ingest,
@@ -746,6 +748,8 @@ pub fn run() {
             list_teams,
             create_team,
             update_team,
+            set_team_shared,
+            add_team_from_catalog,
             delete_team,
             export_agent_snapshot,
             card_mint_key_status,
