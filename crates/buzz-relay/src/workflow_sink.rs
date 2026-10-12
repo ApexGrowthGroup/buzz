@@ -181,6 +181,92 @@ fn append_workflow_mention_tags(
     Ok(())
 }
 
+/// Collect distinct valid NIP-30 shortcodes in first-appearance order.
+fn workflow_emoji_shortcodes(text: &str) -> Vec<String> {
+    let mut shortcodes = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut consumed = 0;
+    for (start, _) in text.match_indices(':') {
+        if start < consumed {
+            continue;
+        }
+        let tail = &text[start + 1..];
+        let len = tail
+            .bytes()
+            .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-')
+            .count();
+        if len > 0 && tail.as_bytes().get(len) == Some(&b':') {
+            consumed = start + len + 2;
+            if let Ok(shortcode) = buzz_sdk::normalize_custom_emoji_shortcode(&tail[..len]) {
+                if seen.insert(shortcode.clone()) {
+                    shortcodes.push(shortcode);
+                }
+            }
+        }
+    }
+    shortcodes
+}
+
+/// Attach only used emoji from the destination community's palette. Match the
+/// clients' newest-set / lexicographically-smallest-URL collision rule.
+async fn append_workflow_emoji_tags(
+    tags: &mut Vec<Tag>,
+    text: &str,
+    community: CommunityId,
+    db: &buzz_db::Db,
+) -> Result<(), ActionSinkError> {
+    let shortcodes = workflow_emoji_shortcodes(text);
+    if shortcodes.is_empty() {
+        return Ok(());
+    }
+    let sets = db
+        .query_events_for_event_write(&buzz_db::event::EventQuery {
+            kinds: Some(vec![buzz_core::kind::KIND_EMOJI_SET as i32]),
+            d_tag: Some(buzz_sdk::CUSTOM_EMOJI_SET_D_TAG.to_owned()),
+            global_only: true,
+            // Same bounded community palette as the desktop client.
+            limit: Some(500),
+            ..buzz_db::event::EventQuery::for_community(community)
+        })
+        .await
+        .map_err(|e| ActionSinkError::Database(e.to_string()))?;
+    let mut palette: std::collections::HashMap<String, (u64, String)> =
+        std::collections::HashMap::new();
+    for set in sets {
+        let created_at = set.event.created_at.as_secs();
+        let mut seen = std::collections::HashSet::new();
+        for tag in set.event.tags.iter() {
+            let parts = tag.as_slice();
+            if parts.len() < 3 || parts[0] != "emoji" || parts[2].is_empty() {
+                continue;
+            }
+            let Ok(shortcode) = buzz_sdk::normalize_custom_emoji_shortcode(&parts[1]) else {
+                continue;
+            };
+            if !seen.insert(shortcode.clone()) || !shortcodes.contains(&shortcode) {
+                continue;
+            }
+            let url = &parts[2];
+            match palette.get(&shortcode) {
+                Some((at, old_url))
+                    if *at > created_at || (*at == created_at && old_url <= url) => {}
+                _ => {
+                    palette.insert(shortcode, (created_at, url.clone()));
+                }
+            }
+        }
+    }
+    for shortcode in shortcodes {
+        if let Some((_, url)) = palette.get(&shortcode) {
+            tags.push(
+                Tag::parse(["emoji", &shortcode, url])
+                    .map_err(|e| ActionSinkError::EventBuild(format!("emoji tag: {e}")))?,
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Relay-side action sink — executes workflow side-effects directly.
 ///
 /// Holds a **weak** reference to `AppState` to avoid an `Arc` reference cycle:
@@ -387,6 +473,8 @@ impl ActionSink for RelayActionSink {
                 &named_members,
                 &author_pubkey_hex,
             )?;
+
+            append_workflow_emoji_tags(&mut tags, &text, tenant.community(), &state.db).await?;
 
             let kind = Kind::from(KIND_STREAM_MESSAGE as u16);
             let event = EventBuilder::new(kind, &text)
@@ -772,6 +860,21 @@ mod tests {
 }
 
 #[cfg(test)]
+mod emoji_tests {
+    use super::workflow_emoji_shortcodes;
+
+    #[test]
+    fn shortcodes_cover_workflow_text_and_ignore_non_icons() {
+        assert_eq!(
+            workflow_emoji_shortcodes("@engineering-lead :octopus: GitHub: #655 closed :OCTOPUS::chat-bubble: :espresso-cup: :binoculars: :bad name: ::"),
+            ["octopus", "chat-bubble", "espresso-cup", "binoculars"]
+        );
+        assert!(workflow_emoji_shortcodes("08:15 https://example.com 🔎").is_empty());
+        assert!(workflow_emoji_shortcodes(&format!(":{}:", "a".repeat(65))).is_empty());
+    }
+}
+
+#[cfg(test)]
 mod postgres_tests {
     //! Regression test for `e3661764` / `7899c1a8`: a workflow `send_message`
     //! that mentions a channel member by name (`@Name`) in its author-written
@@ -892,6 +995,138 @@ mod postgres_tests {
             .as_str()
             .expect("send_message event id")
             .to_owned()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn workflow_send_message_attaches_community_emoji_tags() {
+        let state = test_state().await;
+        let owner = nostr::Keys::generate();
+        let owner_hex = owner.public_key().to_hex();
+        let mut communities = Vec::new();
+        for prefix in ["wf-emoji", "wf-foreign-emoji"] {
+            let host = format!("{prefix}-{}.example", Uuid::new_v4().simple());
+            let community = match state
+                .db
+                .create_community_with_owner(&host, &owner_hex)
+                .await
+                .expect("create emoji community")
+            {
+                CreateCommunityWithOwnerResult::Created(rec) => rec.id,
+                other => panic!("expected fresh community, got {other:?}"),
+            };
+            communities.push(community);
+        }
+        let community = communities[0];
+        let owner_bytes = owner.public_key().to_bytes();
+        state
+            .db
+            .ensure_user(community, &owner_bytes)
+            .await
+            .expect("ensure owner");
+        let channel = state
+            .db
+            .create_channel(
+                community,
+                "wf-emoji",
+                ChannelType::Stream,
+                ChannelVisibility::Open,
+                None,
+                &owner_bytes,
+                None,
+            )
+            .await
+            .expect("create emoji channel");
+
+        // Each set is signed by a different publisher so collisions are live
+        // palette entries, rather than superseded versions of one member's set.
+        let now = nostr::Timestamp::now().as_secs();
+        for (scope, age, entries) in [
+            (
+                community,
+                3,
+                vec![("octopus", "https://cdn.example/old.webp")],
+            ),
+            (
+                community,
+                2,
+                vec![
+                    ("octopus", "https://cdn.example/octopus.webp"),
+                    ("chat-bubble", "https://cdn.example/chat.webp"),
+                    ("espresso-cup", "https://cdn.example/coffee.webp"),
+                    ("binoculars", "https://cdn.example/binoculars.webp"),
+                    ("unused", "https://cdn.example/unused.webp"),
+                ],
+            ),
+            (
+                community,
+                2,
+                vec![("octopus", "https://cdn.example/z-octopus.webp")],
+            ),
+            (
+                communities[1],
+                1,
+                vec![
+                    ("octopus", "https://foreign.example/octopus.webp"),
+                    ("foreign-only", "https://foreign.example/icon.webp"),
+                ],
+            ),
+        ] {
+            let emojis: Vec<buzz_sdk::CustomEmoji> = entries
+                .into_iter()
+                .map(|(shortcode, url)| buzz_sdk::CustomEmoji {
+                    shortcode: shortcode.to_owned(),
+                    url: url.to_owned(),
+                })
+                .collect();
+            let publisher = nostr::Keys::generate();
+            let event = buzz_sdk::build_custom_emoji_set(&emojis)
+                .expect("build palette")
+                .custom_created_at(nostr::Timestamp::from(now - age))
+                .sign_with_keys(&publisher)
+                .expect("sign palette");
+            state
+                .db
+                .insert_event(scope, &event, None)
+                .await
+                .expect("persist palette");
+        }
+        state
+            .workflow_engine
+            .set_action_sink(Arc::new(RelayActionSink::new(&state)));
+        let event_id = execute_send_message_workflow(
+            &state, community, channel.id, &owner_bytes, "emoji-rendering",
+            "@engineering-lead :OCTOPUS: GitHub: #655 closed {{trigger.text}} :octopus: :unknown: :foreign-only:",
+            ":chat-bubble: :espresso-cup: :binoculars:",
+        ).await;
+        let id = nostr::EventId::from_hex(&event_id).expect("message id");
+        let stored = state
+            .db
+            .get_event_by_id_for_event_write(community, id.as_bytes())
+            .await
+            .expect("load workflow output")
+            .expect("message persisted");
+        let emoji_tags: Vec<Vec<String>> = stored
+            .event
+            .tags
+            .iter()
+            .filter(|tag| tag.as_slice()[0] == "emoji")
+            .map(|tag| tag.as_slice().to_vec())
+            .collect();
+        assert_eq!(
+            emoji_tags,
+            vec![
+                vec!["emoji", "octopus", "https://cdn.example/octopus.webp"],
+                vec!["emoji", "chat-bubble", "https://cdn.example/chat.webp"],
+                vec!["emoji", "espresso-cup", "https://cdn.example/coffee.webp"],
+                vec!["emoji", "binoculars", "https://cdn.example/binoculars.webp"],
+            ]
+        );
+        assert!(stored.event.content.contains(":unknown: :foreign-only:"));
+        stored
+            .event
+            .verify()
+            .expect("emoji tags are covered by the event signature");
     }
 
     #[tokio::test]
